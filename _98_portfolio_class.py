@@ -3,6 +3,7 @@ from typing import Tuple, Any
 import numpy as np
 import pandas as pd
 
+import _09_fmo_engine
 from _99_fmo_classes import Loan
 """
 A Portfolio class. Contains all information needed to fully characterize the portfolio, and calculate the 
@@ -61,20 +62,27 @@ class Portfolio:
         self.reference_snapshot = reference_snapshot
         self.ptf_marginal_pd_arr = ptf_marginal_pd_arr
 
+        # Portfolio lifetime schedule 
 
+        # print('Starting future payments')
         self.cashflow_schedule = self.future_payments()
 
+        # print('Starting underlying loan list')
         self.loan_list = self.underlying_loan_list(
             df = reference_snapshot
             )
+        
+        # print('Starting df post processsing')
+        self.df_post_processing()
+        # )
 
-
-        self.cashflow_schedule['Cumulative PD_Exposure'] = self.cashflow_schedule['PD_Exposure'][::-1].cumsum()
+        # self.cashflow_schedule['Cumulative PD_Exposure'] = self.cashflow_schedule['PD_Exposure'][::-1].cumsum()
+        # self.cashflow_schedule['Portfolio Month'] = np.arange(len)
 
     ##################################################
     ########## Cashflow Calculation Section ##########
     ##################################################
-        
+    
     def underlying_loan_list(
         self,
         df: pd.DataFrame
@@ -105,19 +113,19 @@ class Portfolio:
                 payment_frequency = row['payment_frequency'],
                 )
             
+            # print(f'Loan_ID: {loan.identifier}\n payment type: {loan.payment_type}')
             loan.el_df = loan.calculate_pd_and_expected_loss(
                 df = loan.expected_loss_df_setup(
                     self.cashflow_schedule
                     ),
                 marginal_pd_arr = self.ptf_marginal_pd_arr
             )
-
+            
             self.cashflow_schedule = self.total_monthly_cashflow(
                 loan = loan
-            )
+            )            
 
             loans.append(loan)
-
         return loans
     
 
@@ -142,7 +150,10 @@ class Portfolio:
         })
         
         # Concatenate the original DataFrame with the final row
-        payment_df = pd.concat([payment_df, final_row], ignore_index=True)
+        payment_df = pd.concat(
+            [payment_df, final_row], 
+            ignore_index = True
+        )
         
         return payment_df
     
@@ -159,50 +170,105 @@ class Portfolio:
 
         # Identify the common 'Payment Date' values
         common_dates = df['Payment Date'].isin(loan.el_df['Payment Date'])
-        # Get the exact row indices where 'Payment Date' matches
         matched_indices = df.index[common_dates]
 
-        if 'PD_Exposure' not in df.columns:
-            df['PD_Exposure'] = 0.  # Initialize if column does not exist
-
-        # Ensure element-wise addition
-        df.loc[matched_indices, 'PD_Exposure'] += (
-            loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'PD_Exposure'].values
-        )
-
+        if 'PD*Exposure' not in df.columns:
+            df['PD*Exposure'] = 0.  # Initialize if column does not exist
+        
         if 'Portfolio Exposure' not in df.columns:
             df['Portfolio Exposure'] = 0.
 
+        # Ensure element-wise addition
+        df.loc[matched_indices, 'PD*Exposure'] += (
+            loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'PD*Exposure'].values
+        )
+        
         df.loc[matched_indices, 'Portfolio Exposure'] += (
             loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'Exposure'].values
         )   
-
+        
         if 'Portfolio Exposure' in loan.el_df.columns:
             loan.el_df.drop(columns = ['Portfolio Exposure'], inplace = True)
+
+
         return df
     
+
+    def df_post_processing(
+        self
+    ) -> pd.DataFrame:
+        """
+        """
+        df = self.cashflow_schedule
+
+        df['Cumulative PD_Exposure'] = df['PD*Exposure'][::-1].cumsum()
+
+        return df
+
 
     ##########################################################
     ########## Credit Conversion Factor Application ##########
     ##########################################################
 
-    def ccf_portfolio_preprocessing(
+    def ccf_preprocessing(
         self,
         params: Any
     ) -> pd.DataFrame:
         """
         
         """
-
         df = self.cashflow_schedule
+        df['Portfolio Month'] = np.arange(len(df)) + 1
+        
+        df['Portfolio Month Flag'] = df['Portfolio Month'].apply(
+            lambda x: min(
+                sum([x > threshold for threshold in params.perf_window_list]), 3
+                )
+            )
+
 
         if self.portfolio == 'Ararat':
+            # This assumes that EL calculations for Ararat are not performed before the increase
+            # in guarantee
             guarantee = 20_000_000
         else:
             guarantee = params.ccf_guarantee_dict[self.portfolio]
 
         df['Available Guarantee'] = guarantee - df['Portfolio Exposure']
 
+        output_columns = ['Payment Date', 'Portfolio Month', 'Portfolio Month Flag', 'Portfolio Exposure', 
+                           'PD*Exposure', 'Cumulative PD_Exposure', 'Available Guarantee']
+        return df[output_columns]
+    
+    def ccf_application(
+        self,
+        ccf_selected: np.ndarray,
+        marginal_pd_arr: np.ndarray,
+        params: Any
+    ) -> pd.DataFrame:
+        """
+        """
+        
+        df = self.cashflow_schedule.copy()
+        sid_date = params.scheduled_sid_dict[self.portfolio]
+
+        # Initialize Applied CCF column with zeros
+        df['Applied CCF'] = 0.0
+
+        # Create mask for payments before SID
+        mask_before_scheduled_sid = (
+            (df['Payment Date'].dt.year < sid_date.year) |
+            ((df['Payment Date'].dt.year == sid_date.year) & 
+                (df['Payment Date'].dt.month < sid_date.month))
+        )
+
+        # Apply CCF values only to payments before SID using .loc
+        df.loc[mask_before_scheduled_sid, 'Applied CCF'] = ccf_selected[df['Portfolio Month Flag']][mask_before_scheduled_sid]
+        df['Estimated Guarantee'] = df['Available Guarantee'] * df['Applied CCF']
+
+        # Assuming the guarantee behaves as a performing loan established at the current snapshot
+        df['EG*PD'] = df['Estimated Guarantee'] * marginal_pd_arr[:len(df), 0]
+
+        df['Total Exposure'] = df['PD*Exposure'] + df['EG*PD']
         return df
-
-
+ 
