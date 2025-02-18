@@ -1,4 +1,4 @@
-from typing import Tuple, Any
+from typing import Tuple, List, Any
 
 import numpy as np
 import pandas as pd
@@ -66,14 +66,17 @@ class Portfolio:
 
         # print('Starting future payments')
         self.cashflow_schedule = self.future_payments()
+        self.tt = self.future_payments()
 
         # print('Starting underlying loan list')
-        self.loan_list = self.underlying_loan_list(
+        self.loan_list, self.npl_list = self.underlying_loan_list(
             df = reference_snapshot
             )
         
         # print('Starting df post processsing')
         self.df_post_processing()
+
+        self.current_exposure = reference_snapshot['Loan_BalanceCurrent'].sum()
         # )
 
         # self.cashflow_schedule['Cumulative PD_Exposure'] = self.cashflow_schedule['PD_Exposure'][::-1].cumsum()
@@ -86,10 +89,13 @@ class Portfolio:
     def underlying_loan_list(
         self,
         df: pd.DataFrame
-    ) -> list:
+    ) -> Tuple[List[Loan], List[bool]]:
         
         loans = []
-        for _, row in df.iterrows():
+        npl_list = []
+        for index, row in df.iterrows():
+            # print(f'Loan_ID: {row['Loan_ID']}') # for debugging
+
             loan = Loan(
                 # Identification attributes
                 identifier = row['Loan_ID'],
@@ -114,9 +120,13 @@ class Portfolio:
                 )
             
             # print(f'Loan_ID: {loan.identifier}\n payment type: {loan.payment_type}')
+            loan.test = loan.expected_loss_df_setup(
+                portfolio_schedule = self.cashflow_schedule
+            )
+
             loan.el_df = loan.calculate_pd_and_expected_loss(
                 df = loan.expected_loss_df_setup(
-                    self.cashflow_schedule
+                    portfolio_schedule = self.cashflow_schedule,
                     ),
                 marginal_pd_arr = self.ptf_marginal_pd_arr
             )
@@ -126,7 +136,10 @@ class Portfolio:
             )            
 
             loans.append(loan)
-        return loans
+            if row['nPrommiseLoanStatus'] > 2:
+                npl_list.append(index)
+
+        return loans, npl_list
     
 
     def future_payments(
@@ -240,6 +253,7 @@ class Portfolio:
                            'PD*Exposure', 'Cumulative PD_Exposure', 'Available Guarantee']
         return df[output_columns]
     
+
     def ccf_application(
         self,
         ccf_selected: np.ndarray,
@@ -253,22 +267,39 @@ class Portfolio:
         sid_date = params.scheduled_sid_dict[self.portfolio]
 
         # Initialize Applied CCF column with zeros
-        df['Applied CCF'] = 0.0
+        df['Applied CCF'] = 0.
 
         # Create mask for payments before SID
         mask_before_scheduled_sid = (
             (df['Payment Date'].dt.year < sid_date.year) |
             ((df['Payment Date'].dt.year == sid_date.year) & 
-                (df['Payment Date'].dt.month < sid_date.month))
+                (df['Payment Date'].dt.month <= sid_date.month))
         )
 
         # Apply CCF values only to payments before SID using .loc
         df.loc[mask_before_scheduled_sid, 'Applied CCF'] = ccf_selected[df['Portfolio Month Flag']][mask_before_scheduled_sid]
+
         df['Estimated Guarantee'] = df['Available Guarantee'] * df['Applied CCF']
 
         # Assuming the guarantee behaves as a performing loan established at the current snapshot
         df['EG*PD'] = df['Estimated Guarantee'] * marginal_pd_arr[:len(df), 0]
 
-        df['Total Exposure'] = df['PD*Exposure'] + df['EG*PD']
-        return df
- 
+        # Estimated Guarantee Loan Amortized Plan
+        df['EGLAP'] = 0.
+
+        mask_after_sid = ~mask_before_scheduled_sid
+        if mask_after_sid.any() and mask_before_scheduled_sid.any():
+            last_estimated_guarantee = df.loc[mask_before_scheduled_sid, 'Estimated Guarantee'].iloc[-1]
+            remaining_periods = len(df) - mask_before_scheduled_sid.sum()
+            if remaining_periods > 0:
+                df.loc[mask_after_sid, 'EGLAP'] = last_estimated_guarantee / remaining_periods
+
+        df['Total Exposure'] = df['PD*Exposure'] + df['EG*PD'] + df['EGLAP'] * marginal_pd_arr[:len(df), 0]
+
+        ordered_columns = [
+            'Payment Date', 'Portfolio Month', 'Portfolio Month Flag', 
+            'Portfolio Exposure', 'PD*Exposure', 'Cumulative PD_Exposure', 
+            'Available Guarantee', 'Applied CCF', 'Estimated Guarantee', 'EG*PD', 'EGLAP', 'Total Exposure'
+        ]
+        return df[ordered_columns]
+    
