@@ -1,10 +1,9 @@
-from typing import Tuple, List, Any, Dict
+from typing import Tuple, List, Any, Dict, Union
 
 import numpy as np
 import pandas as pd
 
-import _09_fmo_engine
-from _99_fmo_classes import Loan
+from ._99_fmo_classes import Loan
 """
 A Portfolio class. Contains all information needed to fully characterize the portfolio, and calculate the 
 Expected Credit Loss (ECL).
@@ -40,6 +39,7 @@ class Portfolio:
         
         ##### ECL information #####
         age: int,
+        exposure_column: str,
         exposure: float,
         guarantee: float,
 
@@ -50,6 +50,10 @@ class Portfolio:
 
         reference_snapshot: pd.DataFrame,
         ptf_marginal_pd_dict: dict,
+
+        perf_def_split: bool = False,
+        sicr_active: bool = False,
+        lgd_arr: np.ndarray = np.array([0.8754, 0.6210])
     ) -> None:
         
         self.portfolio = portfolio
@@ -59,37 +63,40 @@ class Portfolio:
         self.date = date
 
         self.age = age
+        self.exposure_column = exposure_column
         self.exposure = exposure
         self.guarantee = guarantee
         
         self.sid = sid
         self.scheduled_sid = scheduled_sid
         self.cover_stop_date = cover_stop_date
-        
 
         self.reference_snapshot = reference_snapshot
         self.ptf_marginal_pd_dict = ptf_marginal_pd_dict
 
         # Portfolio lifetime schedule 
         self.cashflow_schedule = self.future_payments()
+        self.principal_exposure = 0.
+        self.default_loss = 0.
 
         # Creation of a list of Loan objects 
         self.loan_list, self.npl_list = self.underlying_loan_list(
-            df = reference_snapshot
+            df = reference_snapshot,
+            perf_def_split = perf_def_split,
+            lgd_arr = lgd_arr,
+            sicr_active = sicr_active
             )
 
         # Further computations
-        self.df_post_processing()
+        # self.df_post_processing()
 
         self.lel = 0.
         self.tranche_loss_dict = {} 
-        self.fmo_loss_bool = False
-        self.stage = 1
-        #self.current_exposure = reference_snapshot['Loan_BalanceCurrent'].sum()
 
     ##################################################
     ########## Cashflow Calculation Section ##########
     ##################################################
+        
     def select_maturity_split(
         self,
         split_variable: int
@@ -114,8 +121,11 @@ class Portfolio:
 
     def underlying_loan_list(
         self,
-        df: pd.DataFrame
-    ) -> Tuple[List[Loan], List[int]]:
+        df: pd.DataFrame,
+        perf_def_split: bool = False,
+        lgd_arr: np.ndarray = np.array([0.8754, 0.6210]),
+        sicr_active: bool = False
+    ) -> Tuple[List[Loan], List[Loan]]:
         """
         Creates Loan objects for each loan in the reference snapshot and calculates expected losses.
         
@@ -134,17 +144,18 @@ class Portfolio:
                 - List of Loan objects
                 - List of indices representing non-performing loans
         """
-        loans = []
         npl_list = []
-        for index, row in df.iterrows():
-            # print(f'Loan_ID: {row['Loan_ID']}') # for debugging
+        loan_list = []
 
+        for _, row in df.iterrows():
+            # print(row['Loan_ID'])
             loan = Loan(
                 # Identification attributes
                 identifier = row['Loan_ID'],
                 portfolio = self.portfolio,
                 currency = self.currency,
                 status = row['nPrommiseLoanStatus'],
+                arrear_days = row['Loan_Arrear_days'],
                 date = self.date,
                 
                 # Loan duration attributes
@@ -154,7 +165,7 @@ class Portfolio:
                 tenor = row['months_remaining'],
                 
                 # Loan exposure attributes
-                principal = row['Loan_BalanceCurrent'], #max(row['Loan_BalanceOriginal'], row['Loan_BalanceDisbursed']),
+                principal = row[self.exposure_column], #max(row['Loan_BalanceOriginal'], row['Loan_BalanceDisbursed']),
 
                 # Loan repayment attributes
                 effective_interest_rate = row['Loan_InterestRateEffective'],
@@ -162,24 +173,43 @@ class Portfolio:
                 payment_frequency = row['payment_frequency'],
                 )
 
-            loan.el_df = loan.calculate_pd_and_expected_loss(
-                df = loan.expected_loss_df_setup(
-                    portfolio_schedule = self.cashflow_schedule,
-                    ),
-                marginal_pd_arr = self.select_maturity_split(
-                    split_variable = row['Loan_TenureMonths']
+            self.principal_exposure += loan.principal
+
+            if row['nPrommiseLoanStatus'] > 2:
+                # loan.stage = 3 # Defaulted loans
+
+                el_df = loan.calculate_pd_and_expected_loss(
+                    df = loan.expected_loss_df_setup(
+                        portfolio_schedule = self.cashflow_schedule,
+                        ),
+                    marginal_pd_arr = self.select_maturity_split(
+                        split_variable = row['Loan_TenureMonths']
+                        ),
+                    lgd = 1#lgd_arr[0]
                     )
-            )
-            
+                
+                loan.el_df = el_df.iloc[[0]]
+                self.default_loss += loan.el_df.loc[0, 'Exposure'] # Sum contributions
+                npl_list.append(loan)
+            else:
+
+                loan.el_df = loan.calculate_pd_and_expected_loss(
+                    df = loan.expected_loss_df_setup(
+                        portfolio_schedule = self.cashflow_schedule,
+                        ),
+                    marginal_pd_arr = self.select_maturity_split(
+                        split_variable = row['Loan_TenureMonths']
+                        ),
+                    sicr_active = sicr_active,
+                    lgd = lgd_arr[1]
+                )
+                
             self.cashflow_schedule = self.total_monthly_cashflow(
                 loan = loan
             )            
 
-            loans.append(loan)
-            if row['nPrommiseLoanStatus'] > 2:
-                npl_list.append(index)
-
-        return loans, npl_list
+            loan_list.append(loan)
+        return loan_list, npl_list
     
 
     def future_payments(
@@ -197,11 +227,12 @@ class Portfolio:
                         payment dates including the final cover stop date
         """
         payment_df = pd.DataFrame({
-            'Payment Date': pd.date_range(start = self.date,
-                                          end = self.cover_stop_date,
-                                          freq = '1ME',
-                                          inclusive = 'left'
-                                          )
+            'Payment Date': pd.date_range(
+                start = self.date,
+                end = self.cover_stop_date,
+                freq = '1ME',
+                inclusive = 'left'
+                )
         })
         
         # Add the final date (cover_stop_date) as a new row
@@ -235,52 +266,47 @@ class Portfolio:
         Returns:
             pd.DataFrame: Updated portfolio cashflow schedule with the loan's contribution
         """
+
         df = self.cashflow_schedule
 
         # Identify the common 'Payment Date' values
         common_dates = df['Payment Date'].isin(loan.el_df['Payment Date'])
         matched_indices = df.index[common_dates]
 
-        if 'PD*Exposure' not in df.columns:
-            df['PD*Exposure'] = 0.  # Initialize if column does not exist
+        # if 'PD*Exposure' not in df.columns:
+        #     df['PD*Exposure'] = 0.  # Initialize if column does not exist
         
-        if 'Portfolio Exposure' not in df.columns:
-            df['Portfolio Exposure'] = 0.
+        # if 'Portfolio Exposure' not in df.columns:
+        #     df['Portfolio Exposure'] = 0.
 
-        # Ensure element-wise addition
-        df.loc[matched_indices, 'PD*Exposure'] += (
-            loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'PD*Exposure'].values
-        )
+        if 'Principal Exposure' not in df.columns:
+            df['Principal Exposure'] = 0.
+
+        if 'Sum ELs' not in df.columns:
+            df['Sum ELs'] = 0.
+
+        # # Ensure element-wise addition
+        # df.loc[matched_indices, 'PD*Exposure'] += (
+        #     loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'PD*Exposure'].values
+        # )
         
-        df.loc[matched_indices, 'Portfolio Exposure'] += (
-            loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'Exposure'].values
-        )   
+        # df.loc[matched_indices, 'Portfolio Exposure'] += (
+        #     loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'PD*Exposure*LGD'].values
+        # )   
+
+        df.loc[matched_indices, 'Principal Exposure'] += (
+            loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'Cum Principal Payments'].values
+        )  
+
+        df.loc[matched_indices, 'Sum ELs'] += (
+            loan.el_df.set_index('Payment Date').loc[df.loc[matched_indices, 'Payment Date'], 'PD*Exposure*LGD'].values
+        )  
         
         if 'Portfolio Exposure' in loan.el_df.columns:
             loan.el_df.drop(columns = ['Portfolio Exposure'], inplace = True)
 
-
         return df
     
-
-    def df_post_processing(
-        self
-    ) -> pd.DataFrame:
-        """
-        Performs post-processing calculations on the portfolio cashflow schedule.
-        
-        Currently calculates the cumulative sum of PD*Exposure values in reverse order
-        to determine the cumulative expected loss at each payment date.
-        
-        Returns:
-            pd.DataFrame: The processed portfolio cashflow schedule with additional metrics
-        """
-        df = self.cashflow_schedule
-
-        df['Cumulative PD_Exposure'] = df['PD*Exposure'][::-1].cumsum()
-
-        return df
-
 
     ##########################################################
     ########## Credit Conversion Factor Application ##########
@@ -307,14 +333,13 @@ class Portfolio:
             pd.DataFrame: Preprocessed cashflow schedule with CCF-related columns
         """
         df = self.cashflow_schedule
+
         df['Portfolio Month'] = np.arange(len(df)) + 1
-        
         df['Portfolio Month Flag'] = df['Portfolio Month'].apply(
             lambda x: min(
                 sum([x > threshold for threshold in params.perf_window_list]), 3
                 )
             )
-
 
         if self.portfolio == 'Ararat':
             # This assumes that EL calculations for Ararat are not performed before the increase
@@ -323,10 +348,11 @@ class Portfolio:
         else:
             guarantee = params.ccf_guarantee_dict[self.portfolio]
 
-        df['Available Guarantee'] = guarantee - df['Portfolio Exposure']
+        df['Available Guarantee'] = (guarantee - df['Principal Exposure']).clip(lower = 0)
 
-        output_columns = ['Payment Date', 'Portfolio Month', 'Portfolio Month Flag', 'Portfolio Exposure', 
-                           'PD*Exposure', 'Cumulative PD_Exposure', 'Available Guarantee']
+        output_columns = ['Payment Date', 'Portfolio Month', 'Portfolio Month Flag', 
+                          'Principal Exposure', #'Portfolio Exposure',
+                          'Available Guarantee', 'Sum ELs']
         return df[output_columns]
     
 
@@ -334,6 +360,7 @@ class Portfolio:
         self,
         ccf_selected: np.ndarray,
         marginal_pd_dict: dict,
+        lgd_guarantee: float,
         params: Any
     ) -> pd.DataFrame:
         """
@@ -354,45 +381,64 @@ class Portfolio:
         Returns:
             pd.DataFrame: Cashflow schedule with CCF applied and total exposure calculated
         """
-
+        
         df = self.cashflow_schedule.copy()
-        sid_date = params.scheduled_sid_dict[self.portfolio]
+        
+        early_sid_hit = self.check_threshold(
+            relative_threshold = .1
+        )
+
+        if (early_sid_hit) | isinstance(params.early_sid_dict[self.portfolio], pd.Timestamp):
+            sid_date = self.date
+            mask_before_scheduled_sid = pd.Series(
+                False, 
+                index = df.index
+            )
+
+            self.sid = True
+        else:
+            sid_date = params.scheduled_sid_dict[self.portfolio]
+
+            # Create mask for payments before SID, where CCF will be applied
+            mask_before_scheduled_sid = (
+                (df['Payment Date'].dt.year < sid_date.year) |
+                ((df['Payment Date'].dt.year == sid_date.year) & 
+                    (df['Payment Date'].dt.month <= sid_date.month))
+            )
 
         # Initialize Applied CCF column with zeros
         df['Applied CCF'] = 0.
 
-        # Create mask for payments before SID
-        mask_before_scheduled_sid = (
-            (df['Payment Date'].dt.year < sid_date.year) |
-            ((df['Payment Date'].dt.year == sid_date.year) & 
-                (df['Payment Date'].dt.month <= sid_date.month))
-        )
-
         # Apply CCF values only to payments before SID using .loc
         df.loc[mask_before_scheduled_sid, 'Applied CCF'] = ccf_selected[df['Portfolio Month Flag']][mask_before_scheduled_sid]
 
-        df['Estimated Guarantee'] = df['Available Guarantee'] * df['Applied CCF']
+        df['Estimated Guarantee'] = df['Available Guarantee'] * df['Applied CCF'] ###
 
         # Assuming the guarantee behaves as a performing loan established at the current snapshot
         if len(df) - mask_before_scheduled_sid.sum() <= 36:
             marginal_pd_arr = marginal_pd_dict['maturity-lower']
+
         else:
             marginal_pd_arr = marginal_pd_dict['maturity-upper']
 
-        df['EG*PD'] = df['Estimated Guarantee'] * marginal_pd_arr[1 : len(df) + 1, 0]
+        df['EG*PD'] = df['Estimated Guarantee'] * marginal_pd_arr[1 : len(df) + 1, 0] ###
+        df['Guarantee EL'] = df['EG*PD'] * lgd_guarantee
 
         # Estimated Guarantee Loan Amortized Plan
         df['EGLAP'] = 0.
 
         mask_after_sid = ~mask_before_scheduled_sid
+        remaining_periods = 0
+
         if mask_after_sid.any() and mask_before_scheduled_sid.any():
             last_estimated_guarantee = df.loc[mask_before_scheduled_sid, 'Estimated Guarantee'].iloc[-1]
             remaining_periods = len(df) - mask_before_scheduled_sid.sum()
-            if remaining_periods > 0:
-                df.loc[mask_after_sid, 'EGLAP'] = last_estimated_guarantee / remaining_periods
+            
+        if remaining_periods > 0:
+            df.loc[mask_after_sid, 'EGLAP'] = last_estimated_guarantee / remaining_periods
 
         # Term related to actual expsoure on-book + Estimated guarantee used before the s.i.d. through the CCF + Amortized plan of the estimated guarantee loan after s.i.d.
-        df['Total Exposure'] = df['PD*Exposure'] + df['EG*PD']
+        df['Portfolio Marginal EL'] = df['Sum ELs'] + df['Guarantee EL']
 
         # Then only add the third component where mask_after_sid is True
         # Ensure the slice length matches the number of True values in mask_after_sid
@@ -401,30 +447,30 @@ class Portfolio:
 
         # Only modify the rows where mask_after_sid is True
         if len(pd_slice) > 0:  # Make sure we have values to add
-            df.loc[mask_after_sid, 'Total Exposure'] += (
-                df.loc[mask_after_sid, 'EGLAP'].iloc[:len(pd_slice)] * pd_slice[:len(df.loc[mask_after_sid])]
+            df.loc[mask_after_sid, 'Portfolio Marginal EL'] += (
+                df.loc[mask_after_sid, 'EGLAP'].iloc[:len(pd_slice)] * pd_slice[:len(df.loc[mask_after_sid])] * lgd_guarantee
             )
         
         ordered_columns = [
             'Payment Date', 'Portfolio Month', 'Portfolio Month Flag', 
-            'Portfolio Exposure', 'PD*Exposure', 'Cumulative PD_Exposure', 
-            'Available Guarantee', 'Applied CCF', 'Estimated Guarantee', 'EG*PD', 'EGLAP', 'Total Exposure'
+            'Sum ELs', 'Principal Exposure', 'Available Guarantee', 
+            'Applied CCF', 'Estimated Guarantee', 'EG*PD', 'EGLAP', 'Portfolio Marginal EL',
         ]
         return df[ordered_columns]
     
-    def marginal_el(
-        self,
-        lgd: float,
-    ) -> None:
+    # def marginal_el(
+    #     self,
+    #     lgd: float,
+    # ) -> None:
         
-        self.cashflow_schedule['Marginal EL'] = self.cashflow_schedule['Total Exposure'] * lgd
+    #     self.cashflow_schedule['Marginal EL'] = self.cashflow_schedule['Total Exposure'] * lgd
 
 
     def tranching_and_lifetime_expected_loss_calculation(
         self,
         tranche_dict: Dict[str, float],
         guarantee_dict: dict
-    ) -> Tuple[float, Dict[str, float], bool]:
+    ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         """
         Calculate the lifetime expected loss (LEL) and its distribution across tranches.
         
@@ -461,16 +507,23 @@ class Portfolio:
             experiences any loss.
         """
 
-        tranches_arr = tranche_dict[self.portfolio]
-        total_lel = self.cashflow_schedule['Marginal EL'].sum()
+        tranches_arr = tranche_dict[self.portfolio].copy()
+        
+        total_lel = self.cashflow_schedule['Portfolio Marginal EL'].sum()
         guarantee_val = guarantee_dict[self.portfolio] # To avoid repeated calls
-        fmo_loss_bool = False
+
+        if isinstance(guarantee_val, np.ndarray):
+            if (self.date.year < 2023) | ( (self.date.year == 2023) & (self.date.month < 4) ):
+                guarantee_val = guarantee_val[0]
+            else:
+                guarantee_val = guarantee_val[1]
 
         # Loss values initialization
         fi_loss = 0.
         ec_loss = 0.
         massif_loss = 0.
         fmo_loss = 0.
+
 
         # Maximum junior and mezzanine tranche losses
         max_junior_loss = tranches_arr[0] * guarantee_val
@@ -498,23 +551,129 @@ class Portfolio:
                 massif_loss = tranches_arr[2] * guarantee_val
                 fmo_loss = residual_loss - (ec_loss + massif_loss)
 
-                fmo_loss_bool = True
-                # Carrying losses into the FMO tranche cause the portfolio to be automatically move into stage 3
-                self.stage = 3
+        out_dictionary = {
+            'junior': fi_loss, 
+            'mezzanine_ec': ec_loss, 
+            'mezzanine_massif': massif_loss, 
+            'senior': fmo_loss
+        }
 
-        return total_lel, {'junior': fi_loss,
-                           'mezzanine_ec': ec_loss,
-                           'mezzanine_massif': massif_loss,
-                           'senior': fmo_loss}, fmo_loss_bool
-    
+        out_dictionary_normalized = {
+            'junior': fi_loss / guarantee_val, 
+            'mezzanine_ec': ec_loss / guarantee_val, 
+            'mezzanine_massif': massif_loss / guarantee_val, 
+            'senior': fmo_loss / guarantee_val
+        }
 
-    # def stage_expected_loss(
-    #     self,
-    # ) -> float:
-    #     """
+        return total_lel, out_dictionary, out_dictionary_normalized
+
+
+    def check_threshold(
+        self,
+        relative_threshold: float = .1
+    ) -> bool:
+        """
+        Check that non-performing loans (NPLs) exposure does not exceed the criteria for an early stop inclusion date
+        """
         
-    #     """
-    #     if self.stage == 1:
-    #         return self.cashflow_schedule.loc[:12, 'Marginal EL'].sum()
-    #     else
-    
+        if not self.npl_list:
+            return False
+
+        tot_def_exposure = 0.
+
+        for npl_loan in self.npl_list:
+            tot_def_exposure += npl_loan.principal
+
+        npl_exposure_ratio = tot_def_exposure / self.exposure
+        if npl_exposure_ratio >= relative_threshold:
+            print('Early stop inclusion date has been hit')
+            return True
+        
+        else:
+            return False
+        
+
+    def tranche_level_sicr(
+        self,
+        tranche_dict: Dict[str, float],
+        guarantee_dict: Dict[str, Union[float, np.ndarray]],
+        mezzanine_threshold: float = 0.17
+    ) -> dict:
+        """
+        """
+
+        tranches_arr = tranche_dict[self.portfolio].copy()
+        tranche_loss_dict = {
+            'junior': 0.,
+            'mezzanine EC': 0.,
+            'mezzanine Massif': 0.,
+            'senior': 0.
+        }
+
+        lifetime_el = self.cashflow_schedule['Portfolio Marginal EL'].sum()
+        el_12m = self.cashflow_schedule.loc[:11, 'Portfolio Marginal EL'].sum()
+        guarantee_val = guarantee_dict[self.portfolio] # To avoid repeated calls
+
+        if isinstance(guarantee_val, np.ndarray):
+            if (self.date.year < 2023) | ( (self.date.year == 2023) & (self.date.month < 4) ):
+                guarantee_val = guarantee_val[0]
+            else:
+                guarantee_val = guarantee_val[1]
+
+        fi_max_loss = tranches_arr[0] * guarantee_val
+
+        if lifetime_el <= fi_max_loss:
+            print('LEL does not fully utilise junior tranche -> stage 1')
+            print(f'LEL = {lifetime_el:.2f}, \033[1m12 months EL = {el_12m:.2f}\033[0m')
+
+            self.stage = 1 
+
+            self.el = el_12m
+            tranche_loss_dict['junior'] = el_12m
+            return tranche_loss_dict
+
+        else:
+            print('LEL fully utilise junior tranche -> stage 1')
+            remaining_loss = lifetime_el - fi_max_loss 
+            
+            ec_max_loss = tranches_arr[1] * guarantee_val
+            massif_max_loss = tranches_arr[2] * guarantee_val
+            
+            if remaining_loss <= mezzanine_threshold * (ec_max_loss + massif_max_loss):
+                print(f'LEL on the mezzanine tranche does not exceed {mezzanine_threshold * 100:.2f}% of the mezzanine tranche ({100 * remaining_loss / (ec_max_loss + massif_max_loss):.2f}%) -> stage 1 and moving to 12 months EL')
+                print(f'LEL = {lifetime_el:.2f}, 12 months EL = {el_12m:.2f}')
+                
+                self.stage = 1
+                self.el = el_12m
+
+                remaining_loss_12m = el_12m - fi_max_loss
+                if remaining_loss_12m < 0:
+                    # Junior is not fully depleted
+                    print('12 months EL does not fully utilise junior tranche')
+                    tranche_loss_dict['junior'] = el_12m
+                    return tranche_loss_dict
+                
+                else:
+                    tranche_loss_dict['junior'] = fi_max_loss
+
+                    tranche_loss_dict['mezzanine EC'] = remaining_loss_12m * 0.9
+                    tranche_loss_dict['mezzanine Massif'] = remaining_loss_12m * 0.1
+            else:
+                if remaining_loss <= (ec_max_loss + massif_max_loss):
+                    print(f'LEL exceeds {mezzanine_threshold * 100:.2f}% of the mezzanine tranche -> stage 2')
+                    self.stage = 2
+                    
+                    tranche_loss_dict['mezzanine EC'] = remaining_loss_12m * 0.9
+                    tranche_loss_dict['mezzanine Massif'] = remaining_loss_12m * 0.1
+
+                    return tranche_loss_dict
+                else:
+                    print(f'LEL exceeds mezzanine tranche -> stage 3')
+                    self.stage = 3
+                    tranche_loss_dict['mezzanine EC'] = ec_max_loss
+                    tranche_loss_dict['mezzanine Massif'] = massif_max_loss
+
+                    tranche_loss_dict['senior'] = remaining_loss - (ec_max_loss + massif_max_loss)
+
+                    return tranche_loss_dict
+
