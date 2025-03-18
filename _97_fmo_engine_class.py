@@ -7,12 +7,12 @@ import pandas as pd
 
 # Custom libraries
 from src import _00_fmo_parameters
-from src import _01_fmo_utils_fun
-from src import _09_fmo_engine
-from src import _10_fmo_json
+from src import _01_utils_fun
+from src import _09_engine
+from src import _10_json
 
 # Custom classes
-from ._98_fmo_portfolio_class import Portfolio
+from ._98_portfolio_class import Portfolio
 
 class IFRS9Engine:
     def __init__(
@@ -33,12 +33,12 @@ class IFRS9Engine:
         self.reference_snapshot = reference_snapshot
 
         # Parameters
-        self.params_data_prep = _00_fmo_parameters.DataPreparationParameters()
-        self.params_application = _00_fmo_parameters.ApplicationParameters()
-        self.params_ccf = _00_fmo_parameters.CreditConversionFactorParameters()
-        self.params_risk = _10_fmo_json.load_risk_parameters('./src/risk_parameters6.json')
+        self.params_data_prep = _00_parameters.DataPreparationParameters()
+        self.params_application = _00_parameters.ApplicationParameters()
+        self.params_ccf = _00_parameters.CreditConversionFactorParameters()
+        self.params_risk = _10_json.load_risk_parameters('./src/risk_parameters6.json')
 
-        self.marginal_pd_curves_dict =_09_fmo_engine.marginal_pd_arr_set_up(
+        self.marginal_pd_curves_dict =_09_engine.marginal_pd_arr_set_up(
             risk_params = self.params_risk,
             params = self.params_application
             )
@@ -115,7 +115,7 @@ class IFRS9Engine:
             Portfolio instance
         """
 
-        ptf_df, ptf_age = _01_fmo_utils_fun.portfolio_snapshot_loader(
+        ptf_df, ptf_age = _01_utils_fun.portfolio_snapshot_loader(
             ptf = portfolio_name,
             reference_snapshot = reference_snapshot,
             params = self.params_data_prep,
@@ -193,7 +193,7 @@ class IFRS9Engine:
         sid_threshold: float = 0.1
     ) -> None:
 
-        ccf_selected = _09_fmo_engine.ccf_selection(
+        ccf_selected = _09_engine.ccf_selection(
             portfolio_age = ptf_obj.age,
             ccf_matrix = self.params_risk['K'],
             params = self.params_ccf
