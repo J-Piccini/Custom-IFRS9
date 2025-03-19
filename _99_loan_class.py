@@ -1,51 +1,45 @@
-from typing import Literal, Union
+from typing import Literal
 import pandas as pd
 import numpy as np
 import numpy_financial as npf
-
 
 class Loan:
     """ 
     A Loan class. Contains payment information related to a single loan and generates payment schedules for 
     loans bearing the following payment types: 'bullet', 'linear', 'interest_only', 'annuity'
     Keyword Arguments:
-    identifier              -- Loan identifier
-    portfolio               -- str: Portfolio to which the loan belongs
+    arrear_days             -- int: Number of arrear days
     currency                -- str: Currency code of the loan
-    principal               -- float: Principal amount remaining on the loan
-    status                  -- int: Loan's status, 0 (performing), 1 (arrear class 1), 2 (arrear class 2), 3 (default 1), 4 (default - absorbing status)
-    arrear_days             -- int: Number of arrear days, used for SICR staging
-
-    tenor                   -- int: Remaining tenor of the loan in months (e.g. tenor 24 suggests the loan will have another 24 months until it is fully repaid)
+    date                    -- pd.Timestamp: Reporting date
+    effective_interest_rate -- float: The effective annual in
+    end_date                -- pd.Timestamp: Loan's end date
+    identifier              -- Loan identifier
     maturity:               -- int: Maturity at origination
     payment_frequency       -- int: Frequency with which repayments occur in months (e.g. quarterly repayments would be 3)
+    portfolio               -- str: Portfolio to which the loan belongs
+    principal               -- float: Principal amount remaining on the loan
+    start_date              -- pd.Timestamp: Loan's start dateterest rate expressed in decimals, e.g. 10% 0.10
+    status                  -- int: Loan's status, 0 (performing), 1 (arrear class 1), 2 (arrear class 2), 3 (default 1), 4 (default - absorbing status)
+    tenor                   -- int: Remaining tenor of the loan in months (e.g. tenor 24 suggests the loan will have another 24 months until it is fully repaid)
     
-    start_date              -- pd.Timestamp: Loan's start date
-    end_date                -- pd.Timestamp: Loan's end date
-    date                    -- pd.Timestamp: Reporting date
-
-    effective_interest_rate -- float: The effective annual interest rate expressed in decimals, e.g. 10% 0.10
     payment_type            -- Literal['bullet', 'linear', 'interest_only', 'annuity']: The type of payment schedule meant for the loan
     """
 
     def __init__(
         self,
-
-        identifier,
-        portfolio: str, 
-        currency: str,
-        principal: float,
-        status: int, 
         arrear_days: int,
-        
-        tenor: int, 
-        maturity: int,
-        payment_frequency: int,
-
-        start_date: pd.Timestamp,
-        end_date: pd.Timestamp,
+        currency: str,
         date: pd.Timestamp,
         effective_interest_rate: float,
+        end_date: pd.Timestamp,
+        identifier: str | int,
+        maturity: int,
+        payment_frequency: int,
+        portfolio: str, 
+        principal: float,
+        start_date: pd.Timestamp,
+        status: int, 
+        tenor: int, 
         payment_type: Literal['bullet', 'linear', 'interest_only', 'annuity'],
     ) -> None:
         
@@ -64,9 +58,11 @@ class Loan:
         self.end_date = end_date
         self.date = date
 
+        # Default values set arbitrarily to 5% if zero, or missing
         self.effective_interest_rate = 0.05 if effective_interest_rate == 0 else abs(effective_interest_rate) if abs(effective_interest_rate) < 1 else abs(effective_interest_rate) / 100
         self.payment_type = payment_type
 
+        # 
         self.original_maturity = self.quality_check_on_def()
         
         payment_dates = self.generate_payment_schedule_dates(
@@ -147,11 +143,9 @@ class Loan:
                 })
 
         else:
-
             if self.payment_type == 'bullet':
                 if tenor == 0:
                     date_series = pd.Series([end_date])
-
                     return pd.DataFrame({
                         'Payment Date': date_series,
                         'Month Number': pd.Series([self.maturity]),
@@ -168,24 +162,13 @@ class Loan:
                     )
                     
                     return pd.DataFrame({
-                        'Payment Date': date_series,# + pd.DateOffset(months = payment_frequency),
+                        'Payment Date': date_series,
                         'Month Number': (pd.Series([1,] * date_series.shape[0]).cumsum() - 1) * payment_frequency,
                         'Payment Number': pd.Series([1,] * date_series.shape[0]).cumsum() - 1,
                         'Payment Accumulation': pd.Series([payment_frequency,] * date_series.shape[0]), # This might be removed if utilisation of 'Payment Accumulation' is substituted by self.payment_frequency
                     })
             
             else:
-                # if tenor / payment_frequency < 1: 
-                #      # If tenor / payment frequency is less than 1 then the next payment is the final one. 
-                #      date_series = pd.Series([end_date])
-
-                #      lifetime_df = pd.DataFrame({
-                #         'Payment Date': date_series,
-                #         'Month Number': (pd.Series([1,] * date_series.shape[0]).cumsum()) * payment_frequency,
-                #         'Payment Number': pd.Series([1,] * date_series.shape[0]).cumsum(),
-                #         'Payment Accumulation': pd.Series([payment_frequency,] * date_series.shape[0]),
-                #     })
-                # else:
                 date_series = pd.date_range(
                     start = start_date, 
                     periods = round(maturity/ payment_frequency) + 1,
@@ -253,22 +236,21 @@ class Loan:
 
         # The following section takes care of the logic for bullet, IO, and linear payments and those payments which have only one payment left
         if (self.payment_type in ['bullet', 'interest_only', 'linear']) or (len(df) == 1): 
-
             if len(df) == 1:
+                # Last payment so principal payment is equal to the entire principal
                 df['Principal Payment'] = self.principal
-            elif self.payment_type in ['bullet', 'interest_only',]:
 
+            elif self.payment_type in ['bullet', 'interest_only',]:
+                # In bullet and IO, principal payment is only made at the end
                 df['Principal Payment'] = [0,] * (len(df) - 1) + [self.principal] 
             
             elif (self.payment_type == 'linear'):
+                # Linear loans have equal monthly principal repayments
                 if df['Month Number'].iloc[0] == 0:
+                    # If Month Number == 0, it means that the loan has just been issued -> no repayment is expected
                     df['Principal Payment'] = [0, ] + [round(self.principal / (len(df) - 1), 2)] * (len(df) - 1)
                 else:
                     df['Principal Payment'] = round(self.principal / max(len(df), 1), 2)
-            
-            # elif len(df) == 1: 
-            #     # One payment means we are in the final payment. Here the annuity payment will be the same as the following calculation since the remaining interest and principal will be repaid
-            #     df['Principal Payment'] = self.principal
 
             # Once the payment goes through on the payment date the final principal will be the outstanding amount
             df['Principal Outstanding'] = (df['Principal Current'] - df['Principal Payment'].cumsum()).clip(lower = 0).round(2)
@@ -282,11 +264,7 @@ class Loan:
                 df['Interest Payment'] = ((df['Principal Outstanding'] + df['Principal Payment']) * df['Interest Rate Applied']).round(2)
                 if df['Month Number'].iloc[0] == 0:
                     df.loc[0, 'Interest Payment'] = 0
-                    
-
-            ## JP:  Modified to Total Payment = Principal Payment + Interest Payment instead of
-            #             Total Payment = Principal Outstanding + Interest Payment
-            # df['Total Payment'] = df['Principal Outstanding'] + df['Interest Payment']
+                
             df['Total Payment'] = df['Principal Payment'] + df['Interest Payment']
         
         elif self.payment_type == 'annuity': 
@@ -350,7 +328,7 @@ class Loan:
         All payments can therefore be assumed to have been made.
         
         Arguments:
-        portfolio_schedule    -- pd.DataFrame: Portfolio-level payment date schedule
+        portfolio_schedule    -- pd.DataFrame: Portfolio-level payment dates schedule
         
         Returns:
             pd.DataFrame      -- Simplified DataFrame with aligned payment dates and exposure calculations
@@ -371,13 +349,17 @@ class Loan:
 
         payment_schedule_copy = self.payment_schedule.copy()
 
-        ######################################
+        """
+        Merge loan payments schedule, to the monthly overview of the Portfolio. This is necessary as some payments might not be monthly,
+        so dates can be different.
+        """
         cum_principal_df = portfolio_schedule_copy.merge(
             payment_schedule_copy[['Short Payment Date', 'Total Payment', 'Month Number', 'Principal Payment']],
             on = 'Short Payment Date',
             how = 'outer'
         )
 
+        # Fill NaNs due to not algined schedule
         cum_principal_df['Total Payment'] = cum_principal_df['Total Payment'].fillna(0.)
         cum_principal_df['Exposure'] = cum_principal_df['Total Payment'][::-1].cumsum()
         cum_principal_df['Principal Payment'] = cum_principal_df['Principal Payment'].fillna(0.)
@@ -400,13 +382,13 @@ class Loan:
     
         # Fill NaNs as 0. NaNs are generated where payment are not being made
         final_df['Total Payment'] = final_df['Total Payment'].fillna(0.)
+
         # final_df['Exposure'] = final_df['Total Payment'][::-1].cumsum()
         final_df['Principal Payment'] = final_df['Principal Payment'].fillna(0)
 
         final_df.drop(columns = ['Short Payment Date'], inplace = True)
         
         self.payment_schedule.drop(columns = ['Short Payment Date'], inplace = True)
-    
         # Drop Rows after maturity is hit
         try:
             max_month_id = final_df['Month Number'].idxmax()
@@ -416,9 +398,7 @@ class Loan:
             final_df.loc[::-1, 'Month Number'] = np.arange(max_value, max_value - len(final_df), -1)
 
         except Exception as e:
-            print(self.identifier)
-            print(self.payment_schedule.head())
-            # system = platform.system()
+            print(e)
 
         return final_df
     
@@ -426,9 +406,9 @@ class Loan:
     def calculate_pd_and_expected_loss(
         self,
         df: pd.DataFrame,
-        marginal_pd_arr: np.ndarray,
-        lgd: float,
         interest_bool: bool,
+        lgd: float,
+        marginal_pd_arr: np.ndarray,
     ) -> pd.DataFrame:
         """
         Calculates probability of default and expected loss for each payment period.
@@ -438,7 +418,9 @@ class Loan:
         
         Arguments:
         df              -- pd.DataFrame: DataFrame from expected_loss_df_setup to append PD calculations
-        marginal_pd_arr -- np.ndarray: Array of marginal PD values indexed by [month, status]
+        interest_bool   -- bool: Depending on its value interests get covered or not, based on contractual obligations 
+        lgd             -- float: Flat lgd value applied to the Loan object
+        marginal_pd_arr -- np.ndarray: Array of marginal PD values
         
         Returns:
             pd.DataFrame -- DataFrame with added 'Marginal PD' and 'PD*Exposure' columns
@@ -450,6 +432,7 @@ class Loan:
         
         # Calculate PD exposure directly
         if interest_bool:
+            # df['Exposure'] has been created using df['Total Payment'][::-1].cumsum()
             df['PD*Exposure'] = df['Exposure'] * df['Marginal PD']
             df['PD*Exposure*LGD'] = df['PD*Exposure'] * lgd
 
@@ -459,20 +442,23 @@ class Loan:
 
         # Order columns for better visualization
         output_columns = ['Payment Date', 'Month Number', 'Cum Principal Payments', 'Total Payment', 
-                          'Exposure', 'Marginal PD',
-                          'PD*Exposure', 'PD*Exposure*LGD']
+                          'Exposure', 'Marginal PD', 'PD*Exposure', 'PD*Exposure*LGD']
         return df[output_columns]
     
 
     def print_loan_info(
         self,
         output: bool = False
-    ) -> Union[None, dict]:
+    ) -> None | dict:
         """
-        Displays key information about the loan.
-        
-        Prints loan attributes including identifier, dates, payment characteristics,
+        Displays key information about the loan. Prints loan attributes including identifier, dates, payment characteristics,
         and principal amount to assist with debugging and inspection.
+        
+        Arguments:
+        output -- bool: If True, the function outputs a dictionary
+
+        Returns:
+            dict: Dictionary with key information
         """
         
         if not output:
@@ -486,7 +472,6 @@ class Loan:
             print(f'Tenor: {self.tenor}')
             print(f'Status: {self.status}')
             print(f'Arrear days: {self.arrear_days}')
-            # print(f'Stage: {self.stage}')
             print(f'Principal: {self.principal}')
         else:
             return {'Loan_ID': self.identifier,
@@ -499,6 +484,5 @@ class Loan:
                     'Tenor': self.tenor,
                     'Status': self.status,
                     'Arrear days': self.arrear_days,
-                    # 'Stage': self.stage,
                     'Principal': self.principal
                     }
