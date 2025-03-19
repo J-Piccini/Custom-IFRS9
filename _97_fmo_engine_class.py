@@ -5,13 +5,13 @@ import numpy as np
 import pandas as pd
 
 # Custom libraries
-from src import _00_parameters
-from src import _01_utils_fun
-from src import _09_engine
-from src import _10_json
+from src import _00_fmo_parameters
+from src import _01_fmo_utils_fun
+from src import _09_fmo_engine
+from src import _10_fmo_json
 
 # Custom classes
-from ._98_portfolio_class import Portfolio
+from ._98_fmo_portfolio_class import Portfolio
 
 class IFRS9Engine:
     def __init__(
@@ -260,7 +260,7 @@ class IFRS9Engine:
             lgd = self.params_risk['lgd'][0]
         )
 
-        old_condition_sid_check = (ptf_obj.cashflow_schedule.loc[:sid_row, 'Percentage EL'] >= sid_threshold).sum()
+        old_condition_sid_check = (ptf_obj.cashflow_schedule.loc[:sid_row, 'Percentage Cum PD'] >= sid_threshold).sum()
         count = 0
 
         while old_condition_sid_check:
@@ -271,7 +271,7 @@ class IFRS9Engine:
                 lgd = self.params_risk['lgd'][0]
             )
 
-            condition_new_sid_check = (ptf_obj.cashflow_schedule.loc[:loop_sid_row-1, 'Percentage EL'] >= sid_threshold).sum()
+            condition_new_sid_check = (ptf_obj.cashflow_schedule.loc[:loop_sid_row-1, 'Percentage Cum PD'] >= sid_threshold).sum()
             if old_condition_sid_check == condition_new_sid_check:
                 break
             else:
